@@ -223,7 +223,13 @@ class DistEvalImpl : public TensorImpl<Policy>,
       } catch (TiledArray::Exception& e) {
         report_and_abort("TiledArray", e.what());
       } catch (madness::MadnessException& e) {
-        report_and_abort("MADNESS", e.what());
+        // MadnessException::what() returns only msg ("MADNESS ASSERTION
+        // FAILED: "); the actual assertion text + file/line live on the
+        // exception via operator<<. Use that to surface the condition
+        // instead of dropping it on the floor.
+        std::stringstream sss;
+        sss << e;
+        report_and_abort("MADNESS", sss.str().c_str());
       } catch (SafeMPI::Exception& e) {
         report_and_abort("SafeMPI", e.what());
       } catch (std::exception& e) {
