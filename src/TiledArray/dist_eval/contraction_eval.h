@@ -734,12 +734,11 @@ class Summa
       const ProcessID world_root =
           proc_grid_.rank_row() * proc_grid_.proc_cols() + group_root;
       // Group::rank() returns -1 when world_root is not a member of the
-      // group (sparse shape masks built for ToT general products can
-      // exclude the world rank computed above). MADNESS bcast then
-      // asserts group_root >= 0 && group_root < group.size(). Fall back
-      // to group rank 0 so the SUMMA step makes forward progress.
-      const ProcessID mapped = row_group.rank(world_root);
-      group_root = (mapped >= 0) ? mapped : 0;
+      // group. For ToT general products with sparse result shapes, the
+      // group may not contain world_root at all — there is no producer
+      // among the consumers, so the bcast must be skipped. Forward -1
+      // to the caller which will treat it as "no bcast needed".
+      group_root = row_group.rank(world_root);
     }
     return group_root;
   }
@@ -751,9 +750,8 @@ class Summa
         col_group.size() < static_cast<ProcessID>(proc_grid_.proc_rows())) {
       const ProcessID world_root =
           group_root * proc_grid_.proc_cols() + proc_grid_.rank_col();
-      // See get_row_group_root above for the rationale.
-      const ProcessID mapped = col_group.rank(world_root);
-      group_root = (mapped >= 0) ? mapped : 0;
+      // See get_row_group_root above.
+      group_root = col_group.rank(world_root);
     }
     return group_root;
   }
@@ -768,6 +766,10 @@ class Summa
     if (!row_group.empty()) {
       // Broadcast column k of slab h of left_.
       ProcessID group_root = get_row_group_root(step_k(s), row_group);
+      // No producer in this group (sparse-shape mask excluded the world
+      // rank that holds this tile) — skip the bcast entirely. The caller
+      // will discover the missing data through the same shape mask.
+      if (group_root < 0) return;
       bcast(step_h(s) * left_slab_size_ + left_start_local_ + step_k(s),
             left_stride_local_, row_group, group_root, 0ul, col);
     }
@@ -783,6 +785,8 @@ class Summa
     if (!col_group.empty()) {
       // Compute the group root process.
       ProcessID group_root = get_col_group_root(step_k(s), col_group);
+      // See bcast_col above: no producer in this group → skip.
+      if (group_root < 0) return;
 
       // Broadcast row k of slab h of right_.
       bcast(step_h(s) * right_slab_size_ + step_k(s) * proc_grid_.cols() +
