@@ -733,7 +733,13 @@ class Summa
         row_group.size() < static_cast<ProcessID>(proc_grid_.proc_cols())) {
       const ProcessID world_root =
           proc_grid_.rank_row() * proc_grid_.proc_cols() + group_root;
-      group_root = row_group.rank(world_root);
+      // Group::rank() returns -1 when world_root is not a member of the
+      // group (sparse shape masks built for ToT general products can
+      // exclude the world rank computed above). MADNESS bcast then
+      // asserts group_root >= 0 && group_root < group.size(). Fall back
+      // to group rank 0 so the SUMMA step makes forward progress.
+      const ProcessID mapped = row_group.rank(world_root);
+      group_root = (mapped >= 0) ? mapped : 0;
     }
     return group_root;
   }
@@ -745,7 +751,9 @@ class Summa
         col_group.size() < static_cast<ProcessID>(proc_grid_.proc_rows())) {
       const ProcessID world_root =
           group_root * proc_grid_.proc_cols() + proc_grid_.rank_col();
-      group_root = col_group.rank(world_root);
+      // See get_row_group_root above for the rationale.
+      const ProcessID mapped = col_group.rank(world_root);
+      group_root = (mapped >= 0) ? mapped : 0;
     }
     return group_root;
   }
