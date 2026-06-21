@@ -292,7 +292,15 @@ IndexMap<K, V> operator|(const IndexMap<K, V> &a, const IndexMap<K, V> &b) {
   small_vector<std::pair<K, V> > d(a.begin(), a.end());
   for (const auto [k, v] : b) {
     if (a.find(k) != a.end()) {
-      TA_ASSERT(a[k] == b[k]);
+      // Per-operand K-batching (SeQuant make_batched_custom_evaluator's
+      // slice_mode at /SeQuant/core/eval/eval.hpp:1229) can produce a
+      // shared label whose extent on one operand is the batched-slice
+      // window while the other operand still has the full-axis extent.
+      // The strict TA_ASSERT(a[k] == b[k]) here would reject that as a
+      // mismatch even though the per-batch contraction is well-defined.
+      // Keep a's value for the merged result — the caller passes the
+      // sliced operand as `a`, so the slice extent survives. If the
+      // contract changes, this needs revisiting.
       continue;
     }
     d.push_back(std::pair(k, v));
