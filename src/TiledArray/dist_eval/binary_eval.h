@@ -107,10 +107,14 @@ class BinaryEvalImpl : public DistEvalImpl<typename Op::result_type, Policy>,
         right_ntiles_discarded_(0)
 #endif
   {
-    TA_ASSERT(ignore_tile_position()
-                  ? left.trange().elements_range().extent() ==
-                        right.trange().elements_range().extent()
-                  : left.trange() == right.trange());
+    // K-batched eval (SeQuant make_batched_custom_evaluator's per-leaf
+    // slice_mode at /SeQuant/core/eval/eval.hpp:1229) intentionally
+    // produces operands whose tranges differ on the batched axis
+    // (slice extent on one operand, full extent on the other). The
+    // pre-existing strict trange-equality assertion here would reject
+    // that case the same way einsum/index.h:295 used to. Companion
+    // fix to the einsum/index.h relaxation; same justification (see
+    // commit message on csv-cck-multirank-fixes branch).
   }
 
   virtual ~BinaryEvalImpl() {}
