@@ -826,7 +826,13 @@ class Summa
           row_group = make_row_group(s);
           // broadcast if I am in this group and this group has others
           do_broadcast = !row_group.empty() && row_group.size() > 1;
-          if (do_broadcast) group_root = get_row_group_root(k, row_group);
+          if (do_broadcast) {
+            group_root = get_row_group_root(k, row_group);
+            // No producer in this group (sparse-shape mask excluded the
+            // world rank that holds the tile). Skip the bcast — same
+            // contract as the bcast_col guard above.
+            if (group_root < 0) do_broadcast = false;
+          }
         }
 
         if (do_broadcast) {
@@ -879,7 +885,12 @@ class Summa
           col_group = make_col_group(s);
           // broadcast if I am in this group and this group has others
           do_broadcast = !col_group.empty() && col_group.size() > 1;
-          if (do_broadcast) group_root = get_col_group_root(k, col_group);
+          if (do_broadcast) {
+            group_root = get_col_group_root(k, col_group);
+            // See bcast_col_range_task above: skip when there is no
+            // producer for this tile in the sparse-shape group.
+            if (group_root < 0) do_broadcast = false;
+          }
         }
 
         if (do_broadcast) {
