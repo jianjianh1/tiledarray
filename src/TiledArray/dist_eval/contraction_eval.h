@@ -20,6 +20,9 @@
 #ifndef TILEDARRAY_DIST_EVAL_CONTRACTION_EVAL_H__INCLUDED
 #define TILEDARRAY_DIST_EVAL_CONTRACTION_EVAL_H__INCLUDED
 
+#include <cstdlib>
+#include <iostream>
+#include <sstream>
 #include <vector>
 
 #include <TiledArray/config.h>
@@ -287,6 +290,42 @@ class Summa
   /// index into the absolute process index (ProcessID)
   /// \return A sparse process group that includes process in the row or
   /// column of this process as defined by \c proc_grid_.
+  /// Round 8 instrumentation: enabled iff env var TA_SUMMA_DEBUG is set
+  /// (any value). Single static bool initialised once per process. Used by
+  /// make_{row,col}_group, get_{row,col}_group_root, bcast_{col,row} to
+  /// dump per-rank state so cross-rank diff can localise the sparse-shape
+  /// group-construction asymmetry that fires the worldgop.h:{1319,1320}
+  /// assertions in the multi-rank ToT path.
+  static bool summa_debug() {
+    static const bool on = (std::getenv("TA_SUMMA_DEBUG") != nullptr);
+    return on;
+  }
+
+  /// Render a process_mask as a compact "[T,F,F,T,...]" string for prints.
+  static std::string mask_str(const std::vector<bool>& m) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < m.size(); ++i) {
+      if (i) oss << ",";
+      oss << (m[i] ? "T" : "F");
+    }
+    oss << "]";
+    return oss.str();
+  }
+
+  /// Render a group's world-rank membership for prints.
+  static std::string group_members_str(const madness::Group& g) {
+    if (g.empty()) return "[]";
+    std::ostringstream oss;
+    oss << "[";
+    for (ProcessID i = 0; i < g.size(); ++i) {
+      if (i) oss << ",";
+      oss << g.world_rank(i);
+    }
+    oss << "]";
+    return oss.str();
+  }
+
   template <typename Shape, typename ProcMap>
   madness::Group make_group(const Shape& shape,
                             const std::vector<bool>& process_mask,
@@ -346,14 +385,30 @@ class Summa
     // return empty group if I am not in this group, otherwise make a group
     // N.B. group key = s + nsteps_ (unique across (h,k) and distinct from the
     // column groups' keys), root flag = k (the within-slab cyclic owner)
-    if (result_row_mask_k[proc_grid_.rank_col()])
-      return make_group(right_.shape(), result_row_mask_k, right_begin_k,
-                        right_end_k, right_stride_, proc_grid_.proc_cols(), k,
-                        s - k + nsteps_, [&](const ProcGrid::size_type col) {
-                          return proc_grid_.map_col(col);
-                        });
-    else
-      return madness::Group();
+    const bool my_bit = result_row_mask_k[proc_grid_.rank_col()];
+    madness::Group g;
+    if (my_bit) {
+      g = make_group(right_.shape(), result_row_mask_k, right_begin_k,
+                     right_end_k, right_stride_, proc_grid_.proc_cols(), k,
+                     s - k + nsteps_, [&](const ProcGrid::size_type col) {
+                       return proc_grid_.map_col(col);
+                     });
+    }
+    if (summa_debug()) {
+      std::ostringstream oss;
+      oss << "[ta-debug] rank=" << TensorImpl_::world().rank()
+          << " make_row_group s=" << s << " k=" << k << " h=" << h
+          << " rank_row=" << proc_grid_.rank_row()
+          << " rank_col=" << proc_grid_.rank_col()
+          << " k_proc_col=" << (k % proc_grid_.proc_cols())
+          << " mask=" << mask_str(result_row_mask_k)
+          << " my_bit=" << my_bit
+          << " group_size=" << g.size()
+          << " group_members=" << group_members_str(g)
+          << "\n";
+      std::cerr << oss.str();
+    }
+    return g;
   }
 
   /// Column process group factory function
@@ -369,14 +424,30 @@ class Summa
 
     // return empty group if I am not in this group, otherwise make a group
     // N.B. group key = s (unique across (h,k)), root flag = k
-    if (result_col_mask_k[proc_grid_.rank_row()])
-      return make_group(
+    const bool my_bit = result_col_mask_k[proc_grid_.rank_row()];
+    madness::Group g;
+    if (my_bit) {
+      g = make_group(
           left_.shape(), result_col_mask_k, h * left_slab_size_ + k,
           h * left_slab_size_ + left_end_, left_stride_, proc_grid_.proc_rows(),
           k, s - k,
           [&](const ordinal_type row) { return proc_grid_.map_row(row); });
-    else
-      return madness::Group();
+    }
+    if (summa_debug()) {
+      std::ostringstream oss;
+      oss << "[ta-debug] rank=" << TensorImpl_::world().rank()
+          << " make_col_group s=" << s << " k=" << k << " h=" << h
+          << " rank_row=" << proc_grid_.rank_row()
+          << " rank_col=" << proc_grid_.rank_col()
+          << " k_proc_row=" << (k % proc_grid_.proc_rows())
+          << " mask=" << mask_str(result_col_mask_k)
+          << " my_bit=" << my_bit
+          << " group_size=" << g.size()
+          << " group_members=" << group_members_str(g)
+          << "\n";
+      std::cerr << oss.str();
+    }
+    return g;
   }
 
   /// Makes the row result mask
@@ -729,11 +800,27 @@ class Summa
   ProcessID get_row_group_root(const ordinal_type k,
                                const madness::Group& row_group) const {
     ProcessID group_root = k % proc_grid_.proc_cols();
-    if (!right_.shape().is_dense() &&
-        row_group.size() < static_cast<ProcessID>(proc_grid_.proc_cols())) {
-      const ProcessID world_root =
+    const bool used_sparse_path =
+        !right_.shape().is_dense() &&
+        row_group.size() < static_cast<ProcessID>(proc_grid_.proc_cols());
+    ProcessID world_root = -1;
+    if (used_sparse_path) {
+      world_root =
           proc_grid_.rank_row() * proc_grid_.proc_cols() + group_root;
       group_root = row_group.rank(world_root);
+    }
+    if (summa_debug()) {
+      std::ostringstream oss;
+      oss << "[ta-debug] rank=" << TensorImpl_::world().rank()
+          << " get_row_group_root k=" << k
+          << " right_dense=" << right_.shape().is_dense()
+          << " group_size=" << row_group.size()
+          << " proc_cols=" << proc_grid_.proc_cols()
+          << " sparse_path=" << used_sparse_path
+          << " world_root=" << world_root
+          << " group_root=" << group_root
+          << " group_members=" << group_members_str(row_group) << "\n";
+      std::cerr << oss.str();
     }
     return group_root;
   }
@@ -741,11 +828,27 @@ class Summa
   ProcessID get_col_group_root(const ordinal_type k,
                                const madness::Group& col_group) const {
     ProcessID group_root = k % proc_grid_.proc_rows();
-    if (!left_.shape().is_dense() &&
-        col_group.size() < static_cast<ProcessID>(proc_grid_.proc_rows())) {
-      const ProcessID world_root =
+    const bool used_sparse_path =
+        !left_.shape().is_dense() &&
+        col_group.size() < static_cast<ProcessID>(proc_grid_.proc_rows());
+    ProcessID world_root = -1;
+    if (used_sparse_path) {
+      world_root =
           group_root * proc_grid_.proc_cols() + proc_grid_.rank_col();
       group_root = col_group.rank(world_root);
+    }
+    if (summa_debug()) {
+      std::ostringstream oss;
+      oss << "[ta-debug] rank=" << TensorImpl_::world().rank()
+          << " get_col_group_root k=" << k
+          << " left_dense=" << left_.shape().is_dense()
+          << " group_size=" << col_group.size()
+          << " proc_rows=" << proc_grid_.proc_rows()
+          << " sparse_path=" << used_sparse_path
+          << " world_root=" << world_root
+          << " group_root=" << group_root
+          << " group_members=" << group_members_str(col_group) << "\n";
+      std::cerr << oss.str();
     }
     return group_root;
   }
@@ -760,6 +863,16 @@ class Summa
     if (!row_group.empty()) {
       // Broadcast column k of slab h of left_.
       ProcessID group_root = get_row_group_root(step_k(s), row_group);
+      if (summa_debug()) {
+        std::ostringstream oss;
+        oss << "[ta-debug] rank=" << TensorImpl_::world().rank()
+            << " bcast_col s=" << s << " k=" << step_k(s)
+            << " group_size=" << row_group.size()
+            << " group_root=" << group_root
+            << " group_members=" << group_members_str(row_group)
+            << " ntiles=" << col.size() << "\n";
+        std::cerr << oss.str();
+      }
       bcast(step_h(s) * left_slab_size_ + left_start_local_ + step_k(s),
             left_stride_local_, row_group, group_root, 0ul, col);
     }
@@ -775,6 +888,16 @@ class Summa
     if (!col_group.empty()) {
       // Compute the group root process.
       ProcessID group_root = get_col_group_root(step_k(s), col_group);
+      if (summa_debug()) {
+        std::ostringstream oss;
+        oss << "[ta-debug] rank=" << TensorImpl_::world().rank()
+            << " bcast_row s=" << s << " k=" << step_k(s)
+            << " group_size=" << col_group.size()
+            << " group_root=" << group_root
+            << " group_members=" << group_members_str(col_group)
+            << " ntiles=" << row.size() << "\n";
+        std::cerr << oss.str();
+      }
 
       // Broadcast row k of slab h of right_.
       bcast(step_h(s) * right_slab_size_ + step_k(s) * proc_grid_.cols() +
@@ -818,6 +941,17 @@ class Summa
         }
 
         if (do_broadcast) {
+          if (summa_debug()) {
+            std::ostringstream oss;
+            oss << "[ta-debug] rank=" << TensorImpl_::world().rank()
+                << " bcast_col_range_task s=" << s << " k=" << k
+                << " index=" << index
+                << " group_size=" << row_group.size()
+                << " group_root=" << group_root
+                << " group_members=" << group_members_str(row_group)
+                << "\n";
+            std::cerr << oss.str();
+          }
           // Broadcast the tile
 #ifdef TILEDARRAY_ENABLE_GLOBAL_COMM_STATS_TRACE
           ++left_ntiles_used_;
@@ -871,6 +1005,17 @@ class Summa
         }
 
         if (do_broadcast) {
+          if (summa_debug()) {
+            std::ostringstream oss;
+            oss << "[ta-debug] rank=" << TensorImpl_::world().rank()
+                << " bcast_row_range_task s=" << s << " k=" << k
+                << " index=" << index
+                << " group_size=" << col_group.size()
+                << " group_root=" << group_root
+                << " group_members=" << group_members_str(col_group)
+                << "\n";
+            std::cerr << oss.str();
+          }
           // Broadcast the tile
 #ifdef TILEDARRAY_ENABLE_GLOBAL_COMM_STATS_TRACE
           ++right_ntiles_used_;
