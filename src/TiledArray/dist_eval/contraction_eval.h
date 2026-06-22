@@ -805,8 +805,16 @@ class Summa
         row_group.size() < static_cast<ProcessID>(proc_grid_.proc_cols());
     ProcessID world_root = -1;
     if (used_sparse_path) {
-      world_root =
-          proc_grid_.rank_row() * proc_grid_.proc_cols() + group_root;
+      // The producer of column k is at proc-col `group_root` within this
+      // process's proc-row. Its world rank is what `make_group` stored in
+      // the group's proc_list (via the proc_map = proc_grid_.map_col).
+      // The original formula `rank_row * proc_cols + group_root` silently
+      // assumed proc_grid_.rank_offset_ == 0, but ProcGrids constructed
+      // for subset contractions (e.g. only a few participating ranks)
+      // can have non-zero rank_offset_, and map_col already adds it.
+      // Use map_col so we look up the same world rank that make_group
+      // put into the group.
+      world_root = proc_grid_.map_col(group_root);
       group_root = row_group.rank(world_root);
     }
     if (summa_debug()) {
@@ -833,8 +841,16 @@ class Summa
         col_group.size() < static_cast<ProcessID>(proc_grid_.proc_rows());
     ProcessID world_root = -1;
     if (used_sparse_path) {
-      world_root =
-          group_root * proc_grid_.proc_cols() + proc_grid_.rank_col();
+      // The producer of row k is at proc-row `group_root` within this
+      // process's proc-col. Its world rank is what `make_group` stored
+      // in the group's proc_list (via the proc_map = proc_grid_.map_row).
+      // The original formula `group_root * proc_cols + rank_col` silently
+      // assumed proc_grid_.rank_offset_ == 0, but ProcGrids constructed
+      // for subset contractions (e.g. only a few participating ranks)
+      // can have non-zero rank_offset_, and map_row already adds it.
+      // Use map_row so we look up the same world rank that make_group
+      // put into the group.
+      world_root = proc_grid_.map_row(group_root);
       group_root = col_group.rank(world_root);
     }
     if (summa_debug()) {
