@@ -564,6 +564,28 @@ inline std::atomic<std::uint64_t> g_clean_runs_ce_ce{0};
 inline std::atomic<std::uint64_t> g_fall_flops_ce_e{0};
 inline std::atomic<std::uint64_t> g_fall_flops_ce_ce{0};
 
+// Per-cell fused-scale (Hadamard scalar*ToT) accounting — the dominant
+// single-thread cost in the repro (fused_scale_t_x_tot_inplace). Gated by
+// TA_GEMM_TIMING; counts per-inner-cell invocations + total streamed elements
+// so we can tell "one huge term" from "many small terms".
+inline std::atomic<std::uint64_t> g_scale_txtot_calls{0};
+inline std::atomic<std::uint64_t> g_scale_txtot_elems{0};
+inline std::atomic<std::uint64_t> g_scale_txtot_maxelems{0};
+inline std::atomic<std::uint64_t> g_scale_totxt_calls{0};
+inline std::atomic<std::uint64_t> g_scale_totxt_elems{0};
+inline void scale_count(std::atomic<std::uint64_t>& calls,
+                        std::atomic<std::uint64_t>& elems, std::size_t n,
+                        std::atomic<std::uint64_t>* maxe = nullptr) {
+  if (!gemm_timing_enabled()) return;
+  calls.fetch_add(1, std::memory_order_relaxed);
+  elems.fetch_add(n, std::memory_order_relaxed);
+  if (maxe) {
+    auto cur = maxe->load(std::memory_order_relaxed);
+    while (n > cur && !maxe->compare_exchange_weak(cur, n)) {
+    }
+  }
+}
+
 /// Dumps the per-regime GEMM-time totals at process exit when TA_GEMM_TIMING
 /// is set. The single inline instance is constructed after <iostream>'s static
 /// init, hence destroyed before std::cerr.
@@ -606,6 +628,18 @@ struct GemmTimingDumper {
                 L(g_fallback_ns_ce_e));
     dump_phases("ce+ce", L(g_kernel_ns_ce_ce), ce_ce, L(g_check_ns_ce_ce),
                 L(g_fallback_ns_ce_ce));
+
+    // ---- per-cell fused-scale (Hadamard scalar*ToT) volume ----
+    {
+      const auto txc = L(g_scale_txtot_calls), txe = L(g_scale_txtot_elems),
+                 txm = L(g_scale_txtot_maxelems);
+      const auto ttc = L(g_scale_totxt_calls), tte = L(g_scale_totxt_elems);
+      std::cerr << "[scale-fused] t_x_tot (scalar*ToT, ToT-right): " << txc
+                << " cell-calls, " << (txe / 1e6) << "M elems streamed, max cell="
+                << txm << " elems\n";
+      std::cerr << "[scale-fused] tot_x_t (ToT*scalar, ToT-left) : " << ttc
+                << " cell-calls, " << (tte / 1e6) << "M elems streamed\n";
+    }
 
     // ---- shape histograms (return clean strided-GEMM FLOPs per regime) ----
     const double clean_flops_e = dump_shapes("ce+e", g_ce_e_shapes);
@@ -1134,6 +1168,7 @@ void fused_scale_tot_x_t_inplace(Result& result, const Left& left,
                                  const Scalar& s) {
   if (left.empty()) return;
   TA_ASSERT(!result.empty());
+  scale_count(g_scale_totxt_calls, g_scale_totxt_elems, left.size());
   inplace_tensor_op(
       [s](typename Result::value_type& MADNESS_RESTRICT r,
           const typename Left::value_type& MADNESS_RESTRICT l) { r += l * s; },
@@ -1146,6 +1181,8 @@ void fused_scale_t_x_tot_inplace(Result& result, const Scalar& s,
                                  const Right& right) {
   if (right.empty()) return;
   TA_ASSERT(!result.empty());
+  scale_count(g_scale_txtot_calls, g_scale_txtot_elems, right.size(),
+              &g_scale_txtot_maxelems);
   inplace_tensor_op(
       [s](typename Result::value_type& MADNESS_RESTRICT r,
           const typename Right::value_type& MADNESS_RESTRICT rr) {
